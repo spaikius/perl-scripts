@@ -1,0 +1,195 @@
+#!/usr/bin/perl
+
+# Programa ieško ir skaičiuoja PDBx faile esančių arabinų
+# (liekanos A5P,AHR,ARA,ARB,FUB,LAI,PAN) atomų C2,C2'
+# „chiralinį tūrį“, t.y atomų aplink anglies C2, C2' atomą piramidės
+# tūrį su ženklu. Teigiamas ženklas priskiriamas gyvojoje gamtoje 
+# paplitusiems optiniams izomerams, o neigiamas - 
+# jų veidrodiniams atspindžiams.
+
+# Svarbu!
+# L-arabinozės (LAI) atomų numeravimas yra kitoks, nei įprastas cukrų C
+# atomų grandinės numeravimas. Pvz. L-arabinozės C grandinės 
+# numeravimas yra 
+# C2-C4-C6-C8-C10
+# 
+# http://www.rcsb.org/ligand/LAI
+
+use strict;
+use warnings;
+
+# PDB(x) informacija apie tyriamias liekanas bus saugoma asoc. masyve.
+# Asoc. masyvo formatas:
+# residue_blocks = (
+#     resi => (                         # Liekanos pav.
+#         chiral_atom => string,        # Chiralinio atomo pav.
+#         chiral_atom_coord => array,   # C2 atomo koordinatės [X, Y, Z]
+#         chain => string,              # Grandinės pav.
+#         resn => string,               # Liekanos ID
+#         atoms => (                    # Atomų asoc. masyvas (be C2' atomo)
+#             atom => array,            # Atomo pav. => koordinatės [X, Y, Z]
+#             ...
+#         )
+#     ),
+#     ...
+# );
+my %residue_blocks;
+
+while( my $entry_line = <> ){
+    if( $entry_line =~ /
+        ^(?:ATOM|HETATM)                # Raktažodis
+        .{11,13}                        # Tarpas tarp raktažodžio ir liekanos
+        (A5P|AHR|ARA|ARB|FUB|LAI|PAN)   # Ieškomos liekanos
+        /x
+       ){
+
+        # Einamos liekanos ID
+        my $resi = trim( substr $entry_line, 23, 4 );
+
+        # Einamos liekanos pavadinimas
+        my $resn = $1;
+
+        # Grandinės pavadinimas
+        my $chain = trim( substr $entry_line, 21, 1 );
+
+        # Einamo atomo pav.
+        my $atom = trim( substr $entry_line, 13, 3 );
+
+        # Einamo atomo koordinatės
+        my @atom_coord;
+
+        # Chiralinio C2 atomo koordinatės
+        my @chiral_atom_coord;
+
+        if( $atom =~ /(?:C2|C2')/ and $resn ne "LAI"
+            or ( $atom =~ /(?:C4|C4')/ and $resn eq "LAI" ) ){
+        #if($atom =~ /(?:C2|C2')/){    
+            @chiral_atom_coord = (
+                isNumeric( trim( substr $entry_line, 31, 7 ) ), # X koord.
+                isNumeric( trim( substr $entry_line, 39, 7 ) ), # Y koord.
+                isNumeric( trim( substr $entry_line, 47, 7 ) )  # Z koord.
+            );
+        } else {
+            @atom_coord = (
+                isNumeric( trim( substr $entry_line, 31, 7 ) ), # X koord.
+                isNumeric( trim( substr $entry_line, 39, 7 ) ), # Y koord.
+                isNumeric( trim( substr $entry_line, 47, 7 ) )  # Z koord.
+            );
+        }
+
+        $residue_blocks{$resi}{"resn"} = $resn;
+        $residue_blocks{$resi}{"chain"} = $chain;
+        $residue_blocks{$resi}{"chiral_atom"} = $atom if @chiral_atom_coord;
+        $residue_blocks{$resi}{"chiral_atom_coord"} = \@chiral_atom_coord 
+            if @chiral_atom_coord;
+
+        $residue_blocks{$resi}{"atoms"}{$atom} = \@atom_coord
+            if @atom_coord;
+    }
+
+    if( eof ){
+        # Perspėjimas, jei įraše nėrasta tinkamų duomenų
+        if( keys %residue_blocks == 0 ){
+            warn("No require data found in: $ARGV");
+            next;
+        }
+
+        foreach my $resi (sort keys %residue_blocks) {
+
+            # Chiralinės anglies X, Y, Z koordinatės
+            my $C2_x = $residue_blocks{$resi}{"chiral_atom_coord"}[0];
+            my $C2_y = $residue_blocks{$resi}{"chiral_atom_coord"}[1];
+            my $C2_z = $residue_blocks{$resi}{"chiral_atom_coord"}[2];
+
+            # Artimiausių atomų "kaimynų" paieška
+            # Ilgiausias kovalentinis ryšys tarp anglies ir kitų atomų yra 
+            # 2.1 angstromai (tarp anglies ir bismuto C-Bi)
+            my $max_bond_lenght = 2.1;
+
+            my %neighbors = %{$residue_blocks{$resi}{"atoms"}};
+            
+            foreach my $atom (keys %neighbors){
+                my $distance = sqrt(  ($neighbors{$atom}[0] - $C2_x)**2
+                                    + ($neighbors{$atom}[1] - $C2_y)**2
+                                    + ($neighbors{$atom}[2] - $C2_z)**2);
+
+                # Pašalinamas atomas, jei atstumas didesnis nei 2.1 A
+                delete $neighbors{$atom} if $distance gt $max_bond_lenght;
+            } 
+
+            # Chiralinio tūrio apskaičiavimas
+
+            # Naudojant mišriąją sandaugą galima rasti chiralinį tūrį.
+            #
+            #                           | Ax Ay Az |
+            # 1/6 * [A x B] * C = 1/6 * | Bx By Bz |
+            #                           | Cx Cy Cz |
+            
+            # Matrica, skaičiuojant mišriąją sandaugą
+            my @m;
+
+            if( scalar keys %neighbors eq 3 ){
+                #Chiralinis atomas turi 3 kaimynus (Vandenilio atomas menamas)
+                # tetraedro viršunė - chiralinis C atomas
+                foreach my $atom ( sort keys %neighbors ){
+                                                   # X - chiralinis C atomas
+                    $neighbors{$atom}[0] -= $C2_x; # Vektorius XA
+                    $neighbors{$atom}[1] -= $C2_y; # Vektorius XB
+                    $neighbors{$atom}[2] -= $C2_z; # Vektorius XC
+
+                    push @m, [@{$neighbors{$atom}}];
+                }
+
+            } elsif (scalar keys %neighbors eq 4){
+                # Chiralinis atomas turi 4 kaimynus
+
+                # Tetraedro viršunės atomas
+                my ($top_atom) = sort keys %neighbors;
+                
+                foreach my $atom ( sort keys %neighbors ){
+                    next if $top_atom eq $atom;
+
+                    $neighbors{$atom}[0] -= $neighbors{$top_atom}[0];
+                    $neighbors{$atom}[1] -= $neighbors{$top_atom}[1];
+                    $neighbors{$atom}[2] -= $neighbors{$top_atom}[2];
+
+                    push @m, [@{$neighbors{$atom}}];
+                }
+
+            } else {
+                warn("Residue: $resi does not have chiral C2' atom");
+                next;
+            }
+
+            my $volume =  $m[0][0] * ($m[1][1]*$m[2][2] - $m[1][2]*$m[2][1])
+                        - $m[0][1] * ($m[1][0]*$m[2][2] - $m[1][2]*$m[2][0])
+                        + $m[0][2] * ($m[1][0]*$m[2][1] - $m[1][1]*$m[2][0]);
+
+            $volume *= 1/6;
+
+            printf "CHIRALITY %.3f %s %s %s %s %s", 
+                $volume, 
+                $ARGV, 
+                $residue_blocks{$resi}{"chain"},
+                $residue_blocks{$resi}{"resn"},
+                $resi,
+                $residue_blocks{$resi}{"chiral_atom"};
+            printf " %s", $_  for sort keys %neighbors;
+            print "\n";
+        }
+        # Išvalom resursus
+        %residue_blocks = ();   
+    }
+}
+
+
+# Funkcija pašalina visus baltus tarpus 
+# esančius eilutės pradžioje arba pabaigoje
+sub trim { my $s = shift; $s =~ s/^\s+|\s+$//g; return $s };
+
+# Funkcija nutraukia programos darba, jei įvestis nėra skaitinės reikšmės
+sub isNumeric { 
+    my $s = shift; 
+    die("Is not a number: $s") if $s !~ /^-?\d+(\.\d+)?$/;
+    return $s;
+}
